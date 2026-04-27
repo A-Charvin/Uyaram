@@ -10,6 +10,8 @@ Detects  : QGIS/OSGeo4W via PATH + filesystem scan
 Features:
   - Global XY + Z ground shift (ground = 0.0 across all tiles)
   - Optional per-class classification filter (collapsed by default)
+  - Optional per-class heightmap export (split mode)
+  - Split mode uses nodata=-1 so layers stack cleanly in Blender
   - Real-time PDAL output streaming
   - Optional mosaic via gdal_merge.py
   - Per-tile Blender Displace modifier values printed in log
@@ -41,6 +43,10 @@ FONT_MONO  = ("Courier New", 9)
 FONT_LABEL = ("Segoe UI", 9)
 FONT_HEAD  = ("Segoe UI", 10, "bold")
 FONT_SMALL = ("Segoe UI", 8)
+
+# ── Placeholder strings — exact match used for guards ────────────────────────
+PLACEHOLDER_SOURCE = "Folder with .las / .laz files"
+PLACEHOLDER_OUTPUT = "Leave blank — outputs alongside source files"
 
 # ── ASCII logo ────────────────────────────────────────────────────────────────
 UYARAM_LOGO = """\
@@ -200,9 +206,7 @@ def _build_pdal_range_filter(selected_codes: list) -> str | None:
     """
     Collapse a list of selected class codes into a compact PDAL
     filters.range limits string.
-
     e.g. [1,2,3,5,6] → 'Classification[1:3],Classification[5:6]'
-
     Returns None if selected_codes is empty.
     """
     if not selected_codes:
@@ -222,6 +226,11 @@ def _build_pdal_range_filter(selected_codes: list) -> str | None:
     ranges.append((start, end))
 
     return ",".join(f"Classification[{s}:{e}]" for s, e in ranges)
+
+
+def _sanitize_filename(label: str) -> str:
+    """'Low Vegetation' → 'low-vegetation'"""
+    return label.lower().replace(" ", "-").replace("/", "-")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -370,15 +379,13 @@ class ClassificationPanel(tk.Frame):
     Collapsible panel with per-class LiDAR classification toggles.
 
     Collapsed by default — header shows a live summary of what is filtered.
-    Expanded — checkboxes grouped by category, each category has all/none.
-    Global all-on / all-off buttons always visible in the header.
+    Expanded — checkboxes grouped by category, each with all/none buttons.
+    Global all-on / all-off always visible in the header.
 
     Public API:
         get_selected_codes() → list[int] | None
-            None  = all classes on, no filter step needed in pipeline
-            list  = these codes will be kept; others removed
         get_filter_summary() → str
-            Human readable one-liner for the log
+        get_split_mode()     → bool
     """
 
     def __init__(self, parent, **kwargs):
@@ -387,12 +394,12 @@ class ClassificationPanel(tk.Frame):
             code: tk.BooleanVar(value=default)
             for code, _, default, _ in CLASSIFICATIONS
         }
-        self._expanded = False
+        self._expanded  = False
+        self._split_var = tk.BooleanVar(value=False)
         self._build()
 
     # ── Build ─────────────────────────────────────────────────────────────
     def _build(self):
-        # Header (always visible)
         self._header = tk.Frame(self, bg=SURFACE2)
         self._header.pack(fill="x")
 
@@ -408,7 +415,6 @@ class ClassificationPanel(tk.Frame):
         )
         self._toggle_btn.pack(side="left", fill="x", expand=True)
 
-        # Global presets always in header
         for label, fn in [("All on", self._all_on), ("All off", self._all_off)]:
             tk.Button(
                 self._header, text=label, font=FONT_SMALL,
@@ -419,12 +425,10 @@ class ClassificationPanel(tk.Frame):
                 command=fn
             ).pack(side="right")
 
-        # Collapsible body — not packed until expanded
         self._body = tk.Frame(self, bg=BG)
         self._build_body()
 
     def _build_body(self):
-        # Group by category
         groups: dict[str, list] = {cat: [] for cat in CATEGORY_ORDER}
         for code, label, _, cat in CLASSIFICATIONS:
             groups[cat].append((code, label))
@@ -434,10 +438,8 @@ class ClassificationPanel(tk.Frame):
             if not items:
                 continue
 
-            # Category header
             cat_row = tk.Frame(self._body, bg=BG)
             cat_row.pack(fill="x", pady=(8, 2))
-
             cat_colour = CATEGORY_COLOURS.get(cat, TEXT_DIM)
 
             tk.Label(
@@ -447,7 +449,6 @@ class ClassificationPanel(tk.Frame):
                 fg=cat_colour, bg=BG
             ).pack(side="left", padx=(4, 12))
 
-            # Category all / none
             for btn_label, state in [("all", True), ("none", False)]:
                 tk.Button(
                     cat_row, text=btn_label, font=FONT_SMALL,
@@ -457,7 +458,6 @@ class ClassificationPanel(tk.Frame):
                     command=lambda c=cat, s=state: self._cat_all(c, s)
                 ).pack(side="right")
 
-            # Checkbox grid — 3 columns
             grid = tk.Frame(self._body, bg=BG)
             grid.pack(fill="x", padx=4)
 
@@ -477,15 +477,38 @@ class ClassificationPanel(tk.Frame):
                     sticky="w", padx=(0, 16), pady=1
                 )
 
-        # Footer note
+        # Split mode toggle
+        tk.Frame(self._body, bg=BORDER, height=1).pack(fill="x", pady=(12, 8))
+        split_row = tk.Frame(self._body, bg=BG)
+        split_row.pack(fill="x")
+        tk.Checkbutton(
+            split_row,
+            text="Export separate heightmap per selected class  (split mode)",
+            variable=self._split_var,
+            font=FONT_LABEL, fg=ACCENT, bg=BG,
+            selectcolor=SURFACE2,
+            activebackground=BG, activeforeground=TEXT,
+            command=self._on_change
+        ).pack(anchor="w")
+        tk.Label(
+            split_row,
+            text="  Split mode: empty cells = 0.0 so layers stack cleanly in Blender.",
+            font=FONT_SMALL, fg=TEXT_DIM, bg=BG
+        ).pack(anchor="w", padx=20)
+        tk.Label(
+            split_row,
+            text="  Warning: N selected classes = ~N× processing time.",
+            font=FONT_SMALL, fg=WARN, bg=BG
+        ).pack(anchor="w", padx=20)
+
         tk.Label(
             self._body,
-            text="  Tip: if your data has no classifications, leave all on — "
+            text="  Tip: if data has no classifications, leave all on — "
                  "no filter step is added to the pipeline.",
             font=FONT_SMALL, fg=TEXT_DIM, bg=BG, anchor="w"
         ).pack(fill="x", pady=(10, 6), padx=4)
 
-    # ── Toggle collapse ────────────────────────────────────────────────────
+    # ── Toggle ────────────────────────────────────────────────────────────
     def _toggle(self):
         self._expanded = not self._expanded
         if self._expanded:
@@ -521,6 +544,9 @@ class ClassificationPanel(tk.Frame):
                 omit += f"  +{rest} more"
             summary = f"{n_on}/{n_total} classes  ·  filtering out: {omit}"
 
+        if self._split_var.get():
+            summary += "  ·  SPLIT MODE"
+
         return f"  Classification filter  ·  {summary}  {arrow}"
 
     def _on_change(self):
@@ -548,7 +574,7 @@ class ClassificationPanel(tk.Frame):
         all_codes      = {code for code, _, _, _ in CLASSIFICATIONS}
         selected_codes = {code for code, var in self._vars.items() if var.get()}
         if selected_codes == all_codes:
-            return None   # all on → no filter step in pipeline
+            return None
         return sorted(selected_codes)
 
     def get_filter_summary(self) -> str:
@@ -561,6 +587,9 @@ class ClassificationPanel(tk.Frame):
             if not self._vars[code].get()
         ]
         return f"removing: {', '.join(off)}"
+
+    def get_split_mode(self) -> bool:
+        return self._split_var.get()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -576,14 +605,18 @@ class UyaramApp(tk.Tk):
         self.resizable(True, True)
         self.minsize(700, 640)
 
-        self._source_var = tk.StringVar()
-        self._output_var = tk.StringVar()
-        self._res_var    = tk.StringVar(value="0.5")
-        self._mosaic_var = tk.BooleanVar(value=False)
-        self._processing = False
-        self._bin_dir    = None
-        self._pdal_exe   = None
-        self._gdal_tool  = None
+        self._source_var   = tk.StringVar()
+        self._output_var   = tk.StringVar()
+        self._res_var      = tk.StringVar(value="0.5")
+        self._mosaic_var   = tk.BooleanVar(value=False)
+        self._processing   = False
+        self._bin_dir      = None
+        self._pdal_exe     = None
+        self._gdal_tool    = None
+
+        # Entry widget references — set during _path_row, used by browse
+        self._source_entry = None
+        self._output_entry = None
 
         self._build_ui()
         self._center_window(780, 760)
@@ -609,7 +642,6 @@ class UyaramApp(tk.Tk):
 
     # ── UI Build ──────────────────────────────────────────────────────────
     def _build_ui(self):
-        # Title strip
         title = tk.Frame(self, bg=SURFACE, height=50)
         title.pack(fill="x")
         title.pack_propagate(False)
@@ -631,15 +663,15 @@ class UyaramApp(tk.Tk):
         content = tk.Frame(self, bg=BG)
         content.pack(fill="both", expand=True, padx=20, pady=16)
 
-        # Path rows
-        self._path_row(
+        # ── Path rows — store entry refs ──────────────────────────────────
+        self._source_entry = self._path_row(
             content, "Source Folder",
-            "Folder with .las / .laz files",
+            PLACEHOLDER_SOURCE,
             self._source_var, self._browse_source
         )
-        self._path_row(
+        self._output_entry = self._path_row(
             content, "Output Folder",
-            "Leave blank — outputs alongside source files",
+            PLACEHOLDER_OUTPUT,
             self._output_var, self._browse_output
         )
 
@@ -739,13 +771,16 @@ class UyaramApp(tk.Tk):
         ]:
             self._log.tag_config(tag, foreground=col)
 
-    def _path_row(self, parent, label, hint, var, command):
+    def _path_row(self, parent, label, hint, var, command) -> tk.Entry:
+        """Build a labelled path input row. Returns the Entry widget."""
         frame = tk.Frame(parent, bg=BG)
         frame.pack(fill="x", pady=(0, 10))
+
         tk.Label(
             frame, text=label, font=FONT_HEAD,
             fg=TEXT_BRT, bg=BG, width=14, anchor="w"
         ).pack(side="left")
+
         entry = tk.Entry(
             frame, textvariable=var, font=FONT_MONO,
             bg=SURFACE2, fg=TEXT_DIM,
@@ -779,26 +814,37 @@ class UyaramApp(tk.Tk):
             padx=10, pady=5, command=command
         ).pack(side="left")
 
-    # ── Browse ────────────────────────────────────────────────────────────
+        return entry   # caller stores this reference
+
+    # ── Browse — write directly to entry to avoid FocusOut race ──────────
     def _browse_source(self):
         folder = filedialog.askdirectory(
             title="Select folder containing .las/.laz files"
         )
         if folder:
             self._source_var.set(folder)
+            self._source_entry.config(fg=TEXT)
+            self._source_entry.delete(0, "end")
+            self._source_entry.insert(0, folder)
 
     def _browse_output(self):
         folder = filedialog.askdirectory(title="Select output folder")
         if folder:
             self._output_var.set(folder)
+            self._output_entry.config(fg=TEXT)
+            self._output_entry.delete(0, "end")
+            self._output_entry.insert(0, folder)
 
     # ── Processing ────────────────────────────────────────────────────────
     def _start_processing(self):
         if self._processing:
             return
 
-        source = self._source_var.get().strip()
-        if not source or "Folder" in source:
+        # Read directly from entry widget — the ground truth for what's shown
+        source = self._source_entry.get().strip()
+
+        # Exact match against placeholder — never a substring check
+        if not source or source == PLACEHOLDER_SOURCE:
             self._log_line("⚠  Select a source folder first.", "warn")
             return
 
@@ -807,10 +853,11 @@ class UyaramApp(tk.Tk):
             self._log_line(f"✗  Not a valid directory: {source}", "error")
             return
 
-        raw_out     = self._output_var.get().strip()
+        # Read output from entry widget too
+        raw_out = self._output_entry.get().strip()
         output_path = (
             source_path
-            if (not raw_out or "Leave" in raw_out or "blank" in raw_out.lower())
+            if (not raw_out or raw_out == PLACEHOLDER_OUTPUT)
             else Path(raw_out)
         )
         output_path.mkdir(parents=True, exist_ok=True)
@@ -826,6 +873,14 @@ class UyaramApp(tk.Tk):
         # Snapshot classification state before handing to thread
         selected_codes = self._clf_panel.get_selected_codes()
         filter_summary = self._clf_panel.get_filter_summary()
+        split_mode     = self._clf_panel.get_split_mode()
+
+        if split_mode and selected_codes and len(selected_codes) > 3:
+            self._log_line(
+                f"⚠  Split mode: {len(selected_codes)} classes "
+                f"→ ~{len(selected_codes)}× processing time",
+                "warn"
+            )
 
         self._processing = True
         self._run_btn.config(state="disabled", bg=BORDER, fg=TEXT_DIM)
@@ -835,7 +890,7 @@ class UyaramApp(tk.Tk):
         threading.Thread(
             target=self._pipeline_thread,
             args=(source_path, output_path, resolution,
-                  selected_codes, filter_summary),
+                  selected_codes, filter_summary, split_mode),
             daemon=True
         ).start()
 
@@ -847,6 +902,7 @@ class UyaramApp(tk.Tk):
         resolution:     float,
         selected_codes: list | None,
         filter_summary: str,
+        split_mode:     bool,
     ):
         try:
             import laspy
@@ -863,7 +919,13 @@ class UyaramApp(tk.Tk):
         self._log_line(f"  Source     : {source_path}", "dim")
         self._log_line(f"  Output     : {output_path}", "dim")
         self._log_line(f"  Resolution : {resolution}m/px", "dim")
-        self._log_line(f"  Filter     : {filter_summary}\n", "dim")
+        self._log_line(f"  Filter     : {filter_summary}", "dim")
+        if split_mode:
+            self._log_line(
+                "  Split mode : ON — separate heightmap per class\n", "accent"
+            )
+        else:
+            self._log_line("", "dim")
 
         files = (
             list(source_path.glob("*.las")) +
@@ -911,84 +973,116 @@ class UyaramApp(tk.Tk):
         for laz in valid:
             self._log_line(f"\n  ▶ {laz.name}", "accent")
             try:
-                out_tif = output_path / f"{laz.stem}_heightmap.tif"
-                jf      = output_path / f"{laz.stem}_pipeline.json"
+                # Determine what passes to run for this tile
+                if split_mode and selected_codes is not None:
+                    # One pass per selected class
+                    passes = [
+                        (code, next(
+                            lbl for c, lbl, _, _ in CLASSIFICATIONS
+                            if c == code
+                        ))
+                        for code in selected_codes
+                    ]
+                else:
+                    # Single combined pass
+                    passes = [(None, "combined")]
 
-                # Build pipeline steps list
-                pipeline_steps = [str(laz.resolve())]
+                for code, class_label in passes:
+                    # Build output filename
+                    if code is None:
+                        out_tif = output_path / f"{laz.stem}_heightmap.tif"
+                    else:
+                        safe    = _sanitize_filename(class_label)
+                        out_tif = output_path / f"{laz.stem}_{safe}.tif"
 
-                # Classification filter — only injected when not all-on
-                if selected_codes is not None:
-                    if len(selected_codes) == 0:
+                    safe_label = class_label.replace(" ", "_").replace("/", "-")
+                    jf = output_path / f"{laz.stem}_{safe_label}_pipeline.json"
+
+                    # Build PDAL pipeline
+                    steps = [str(laz.resolve())]
+
+                    if code is not None:
+                        # Single class filter (split mode)
+                        steps.append({
+                            "type":   "filters.range",
+                            "limits": f"Classification[{code}:{code}]"
+                        })
                         self._log_line(
-                            "    ⚠  No classes selected — skipping tile",
-                            "warn"
+                            f"    · [{code}] {class_label}", "dim"
+                        )
+                    elif selected_codes is not None:
+                        # Combined multi-class filter
+                        limits = _build_pdal_range_filter(selected_codes)
+                        if limits:
+                            steps.append({
+                                "type":   "filters.range",
+                                "limits": limits
+                            })
+                            self._log_line(
+                                f"    · Filter : {limits}", "dim"
+                            )
+                    else:
+                        self._log_line(
+                            "    · Filter : none (all classes)", "dim"
+                        )
+
+                    # XY + Z shift
+                    steps.append({
+                        "type":   "filters.transformation",
+                        "matrix": (
+                            f"1 0 0 -{gx} "
+                            f"0 1 0 -{gy} "
+                            f"0 0 1 -{gz} "
+                            f"0 0 0 1"
+                        )
+                    })
+
+                    # GDAL writer
+                    # Split mode uses nodata=0 so empty cells sit at ground
+                    # level and planes stack cleanly in Blender without
+                    # negative displacement artefacts from unused regions.
+                    nodata_val = -1 if (split_mode and code is not None) else -2
+
+                    steps.append({
+                        "type":        "writers.gdal",
+                        "filename":    str(out_tif.resolve()),
+                        "resolution":  resolution,
+                        "output_type": "max",
+                        "data_type":   "float",
+                        "nodata":      nodata_val,
+                        "gdalopts":    "COMPRESS=DEFLATE,PREDICTOR=3"
+                    })
+
+                    with open(jf, "w") as f:
+                        json.dump({"pipeline": steps}, f, indent=2)
+
+                    # Stream PDAL live
+                    process = subprocess.Popen(
+                        [self._pdal_exe, "pipeline", str(jf)],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True, bufsize=1, errors="replace"
+                    )
+                    for line in process.stdout:
+                        line = line.strip()
+                        if line:
+                            self._log_line(f"    pdal: {line}", "dim")
+                    process.wait()
+                    jf.unlink(missing_ok=True)
+
+                    if process.returncode != 0:
+                        self._log_line(
+                            f"    ✗ PDAL error (code {process.returncode})",
+                            "error"
                         )
                         fail += 1
                         continue
 
-                    limits = _build_pdal_range_filter(selected_codes)
-                    if limits:
-                        pipeline_steps.append({
-                            "type":   "filters.range",
-                            "limits": limits
-                        })
-                        self._log_line(
-                            f"    · Filter   : {limits}", "dim"
-                        )
-                else:
                     self._log_line(
-                        "    · Filter   : none (all classes pass)", "dim"
+                        f"    ✔ {out_tif.name}", "success"
                     )
 
-                # XY + Z ground shift
-                pipeline_steps.append({
-                    "type":   "filters.transformation",
-                    "matrix": (
-                        f"1 0 0 -{gx} "
-                        f"0 1 0 -{gy} "
-                        f"0 0 1 -{gz} "
-                        f"0 0 0 1"
-                    )
-                })
-
-                # GDAL writer
-                pipeline_steps.append({
-                    "type":        "writers.gdal",
-                    "filename":    str(out_tif.resolve()),
-                    "resolution":  resolution,
-                    "output_type": "max",
-                    "data_type":   "float",
-                    "nodata":      -2,
-                    "gdalopts":    "COMPRESS=DEFLATE,PREDICTOR=3"
-                })
-
-                with open(jf, "w") as f:
-                    json.dump({"pipeline": pipeline_steps}, f, indent=2)
-
-                # Stream PDAL output live
-                process = subprocess.Popen(
-                    [self._pdal_exe, "pipeline", str(jf)],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, errors="replace"
-                )
-                for line in process.stdout:
-                    line = line.strip()
-                    if line:
-                        self._log_line(f"    pdal: {line}", "dim")
-                process.wait()
-                jf.unlink(missing_ok=True)
-
-                if process.returncode != 0:
-                    self._log_line(
-                        f"    ✗ PDAL exited with code {process.returncode}",
-                        "error"
-                    )
-                    fail += 1
-                    continue
-
-                # Blender values from header stats
+                # Blender values — based on full tile header
                 with laspy.open(laz) as fh:
                     raw_min = fh.header.mins[2] - gz
                     raw_max = fh.header.maxs[2] - gz
@@ -1004,15 +1098,12 @@ class UyaramApp(tk.Tk):
                     if mid > 0 else "0.0"
                 )
 
-                self._log_line(f"    ✔ {out_tif.name}", "success")
-                self._log_line(
-                    f"    · Height   : {raw_min:.2f}m → {raw_max:.2f}m", "dim"
-                )
                 if raw_min < 0:
                     self._log_line(
-                        f"    · Depressions: {abs(raw_min):.2f}m preserved",
+                        f"    · Depressions : {abs(raw_min):.2f}m preserved",
                         "accent"
                     )
+
                 self._log_line(
                     "    ┌─ Blender Displace modifier ───────────────",
                     "warn"
@@ -1033,8 +1124,8 @@ class UyaramApp(tk.Tk):
                 self._log_line(f"    ✗ Error: {e}", "error")
                 fail += 1
 
-        # ── Mosaic ────────────────────────────────────────────────────────
-        if self._mosaic_var.get() and ok > 0:
+        # ── Mosaic (combined mode only) ───────────────────────────────────
+        if self._mosaic_var.get() and ok > 0 and not split_mode:
             self._log_line(
                 "\n── Mosaic ──────────────────────────────────────", "dim"
             )
@@ -1100,9 +1191,31 @@ class UyaramApp(tk.Tk):
             "  5. Midlevel and Strength: use values printed per tile above",
             "dim"
         )
-        self._log_line(
-            "  6. Shade Flat (not Shade Smooth)\n", "dim"
-        )
+        self._log_line("  6. Shade Flat (not Shade Smooth)", "dim")
+
+        if split_mode:
+            self._log_line(
+                "\n── Split mode stacking in Blender ──────────────",
+                "accent"
+            )
+            self._log_line(
+                "  · Each class is a separate plane at Z=0", "dim"
+            )
+            self._log_line(
+                "  · Empty cells = 0.0 → flat ground, no downward spikes", "dim"
+            )
+            self._log_line(
+                "  · Stack all planes at the same XY position", "dim"
+            )
+            self._log_line(
+                "  · Assign different materials per plane", "dim"
+            )
+            self._log_line(
+                "  · e.g. buildings=white clay · trees=green · ground=beige\n",
+                "dim"
+            )
+        else:
+            self._log_line("", "dim")
 
         self._done(ok, fail)
 
