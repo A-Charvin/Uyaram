@@ -2,20 +2,24 @@
 """
 Uyaram - Point Cloud to Heightmap
 Malayalam: Uyaram = height
+Version: 1.2.5
 
 Standalone GUI. Zero osgeo, zero numpy, zero pip gdal.
 Requires : Python 3.8+, tkinter, laspy[lazrs]
-Detects  : QGIS/OSGeo4W via PATH + filesystem scan
+Detects  : QGIS/OSGeo4W via PATH + filesystem scan (prefers locations with gdal_merge.py)
 
 Features:
   - Global XY + Z ground shift (ground = 0.0 across all tiles)
   - Optional per-class classification filter (collapsed by default)
   - Optional per-class heightmap export (split mode)
   - Split mode uses nodata=-1 so layers stack cleanly in Blender
+  - Per-class mosaic: merges all tile outputs of the same class into one file
   - Real-time PDAL output streaming
-  - Optional mosaic via gdal_merge.py
-  - Per-tile Blender Displace modifier values printed in log
+  - Graceful handling of empty classes (no points for a class)
+  - Per-tile Blender Displace Strength values printed in log
 """
+
+__version__ = "1.2.5"
 
 import sys
 import json
@@ -49,14 +53,14 @@ PLACEHOLDER_SOURCE = "Folder with .las / .laz files"
 PLACEHOLDER_OUTPUT = "Leave blank — outputs alongside source files"
 
 # ── ASCII logo ────────────────────────────────────────────────────────────────
-UYARAM_LOGO = """\
+UYARAM_LOGO = f"""\
 ██╗   ██╗██╗   ██╗ █████╗ ██████╗  █████╗ ███╗   ███╗
 ██║   ██║╚██╗ ██╔╝██╔══██╗██╔══██╗██╔══██╗████╗ ████║
 ██║   ██║ ╚████╔╝ ███████║██████╔╝███████║██╔████╔██║
 ██║   ██║  ╚██╔╝  ██╔══██║██╔══██╗██╔══██║██║╚██╔╝██║
 ╚██████╔╝   ██║   ██║  ██║██║  ██║██║  ██║██║ ╚═╝ ██║
  ╚═════╝    ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚═╝
-  Point Cloud → Heightmap  ·  Malayalam: Uyaram = Height\
+  Point Cloud → Heightmap  ·  Malayalam: Uyaram = Height  ·  v{__version__}\
 """
 
 # ── LiDAR classification definitions ─────────────────────────────────────────
@@ -147,14 +151,25 @@ def _check_python_deps():
 
 
 def _find_qgis_tools():
-    """Locate pdal and a GDAL merge tool via PATH then filesystem scan."""
-    pdal       = shutil.which("pdal")
-    gdal_trans = shutil.which("gdal_translate")
-    gdal_merge = shutil.which("gdal_merge.py")
+    """
+    Locate pdal.exe and gdal_merge.py via PATH then filesystem scan.
+    Prefers locations that have BOTH tools. If first candidate lacks gdal_merge.py,
+    continues searching for a better match.
+    Returns (bin_dir, pdal_path, gdal_merge_path) or (None, None, None).
+    """
+    # First, check if PATH already has both
+    pdal_path = shutil.which("pdal")
+    merge_path = shutil.which("gdal_merge.py")
+    
+    if pdal_path and merge_path:
+        # If they're in the same bin folder, great
+        if Path(pdal_path).parent == Path(merge_path).parent:
+            return Path(pdal_path).parent, pdal_path, merge_path
+        # Otherwise, prefer the pdal location and hope merge is findable later
+        return Path(pdal_path).parent, pdal_path, merge_path
 
-    if pdal and (gdal_trans or gdal_merge):
-        return Path(pdal).parent, pdal, gdal_trans or gdal_merge
-
+    # Scan common roots, collecting candidates that have pdal.exe
+    candidates = []
     roots  = [Path(r"C:\OSGeo4W"), Path(r"C:\OSGeo4W64")]
     roots += [Path(p) for p in glob.glob(r"C:\Program Files\QGIS*")]
     roots += [Path(p) for p in glob.glob(r"C:\Program Files (x86)\QGIS*")]
@@ -166,10 +181,12 @@ def _find_qgis_tools():
         if not bin_dir.exists():
             continue
 
-        pdal_exe  = bin_dir / "pdal.exe"
-        trans_exe = bin_dir / "gdal_translate.exe"
-        merge_py  = bin_dir / "gdal_merge.py"
+        pdal_exe = bin_dir / "pdal.exe"
+        if not pdal_exe.exists():
+            continue
 
+        # Check for gdal_merge.py in bin or Python Scripts
+        merge_exe = bin_dir / "gdal_merge.py"
         scripts_merge = None
         for py_ver in ["Python312", "Python311", "Python310", "Python39", "Python38"]:
             cand = root / "apps" / py_ver / "Scripts" / "gdal_merge.py"
@@ -177,21 +194,28 @@ def _find_qgis_tools():
                 scripts_merge = str(cand)
                 break
 
-        if pdal_exe.exists():
-            if trans_exe.exists():
-                return bin_dir, str(pdal_exe), str(trans_exe)
-            if merge_py.exists():
-                return bin_dir, str(pdal_exe), str(merge_py)
-            if scripts_merge:
-                return bin_dir, str(pdal_exe), scripts_merge
+        has_merge = merge_exe.exists() or scripts_merge is not None
+        candidates.append((bin_dir, str(pdal_exe), str(merge_exe if merge_exe.exists() else scripts_merge), has_merge))
 
-    # Last resort deep scan
+    # Prefer candidates that have both tools
+    for bin_dir, pdal, merge, has_merge in candidates:
+        if has_merge:
+            return bin_dir, pdal, merge
+
+    # If none have both, return the first with pdal (mosaic will be skipped)
+    if candidates:
+        bin_dir, pdal, merge, _ = candidates[0]
+        return bin_dir, pdal, merge if merge != "None" else None
+
+    # Last resort deep scan for pdal.exe
     try:
         for pf in Path("C:\\").rglob("pdal.exe"):
-            bc   = pf.parent
+            bc = pf.parent
+            # Check for gdal_merge.py in same bin or sibling Scripts
+            merge_exe = bc / "gdal_merge.py"
+            if merge_exe.exists():
+                return bc, str(pf), str(merge_exe)
             root = bc.parent
-            if (bc / "gdal_translate.exe").exists():
-                return bc, str(pf), str(bc / "gdal_translate.exe")
             for py_ver in ["Python312", "Python311", "Python310", "Python39", "Python38"]:
                 sc = root / "apps" / py_ver / "Scripts" / "gdal_merge.py"
                 if sc.exists():
@@ -241,7 +265,7 @@ class StartupChecker(tk.Toplevel):
     def __init__(self, parent, on_ready):
         super().__init__(parent)
         self.on_ready = on_ready
-        self.title("Uyaram - Checking dependencies")
+        self.title(f"Uyaram v{__version__} - Checking dependencies")
         self.configure(bg=BG)
         self.resizable(False, False)
         self._center(520, 430)
@@ -305,10 +329,10 @@ class StartupChecker(tk.Toplevel):
         if bin_dir:
             self._write(f"  ✔ Found in: {bin_dir}", "ok")
             self._write("    • pdal", "dim")
-            self._write(
-                f"    • {Path(gdal_tool).name if gdal_tool else 'gdal tool not found'}",
-                "dim"
-            )
+            if gdal_tool:
+                self._write(f"    • {Path(gdal_tool).name}", "dim")
+            else:
+                self._write("    • gdal_merge.py not found (mosaic will be skipped)", "warn")
         else:
             self._write("  ✗ QGIS / OSGeo4W not found", "err")
             self._write(
@@ -492,7 +516,7 @@ class ClassificationPanel(tk.Frame):
         ).pack(anchor="w")
         tk.Label(
             split_row,
-            text="  Split mode: empty cells = 0.0 so layers stack cleanly in Blender.",
+            text="  Split mode: empty cells = -1.0 so layers stack cleanly in Blender.",
             font=FONT_SMALL, fg=TEXT_DIM, bg=BG
         ).pack(anchor="w", padx=20)
         tk.Label(
@@ -600,7 +624,7 @@ class UyaramApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.withdraw()
-        self.title("Uyaram - Point Cloud to Heightmap")
+        self.title(f"Uyaram v{__version__} - Point Cloud to Heightmap")
         self.configure(bg=BG)
         self.resizable(True, True)
         self.minsize(700, 640)
@@ -646,7 +670,7 @@ class UyaramApp(tk.Tk):
         title.pack(fill="x")
         title.pack_propagate(False)
         tk.Label(
-            title, text="UYARAM",
+            title, text=f"UYARAM v{__version__}",
             font=("Courier New", 13, "bold"), fg=ACCENT, bg=SURFACE
         ).pack(side="left", padx=18, pady=12)
         tk.Label(
@@ -705,16 +729,6 @@ class UyaramApp(tk.Tk):
         self._clf_panel = ClassificationPanel(content)
         self._clf_panel.pack(fill="x")
         tk.Frame(content, bg=BORDER, height=1).pack(fill="x", pady=(6, 0))
-
-        # Blender info strip
-        info = tk.Frame(content, bg=SURFACE2)
-        info.pack(fill="x", pady=(10, 0))
-        tk.Label(
-            info,
-            text="  Blender: Plane → Subdivide (1999 cuts) → "
-                 "Displace | Non-Color | Midlevel: see log",
-            font=("Courier New", 8), fg=TEXT_DIM, bg=SURFACE2, anchor="w"
-        ).pack(fill="x", padx=8, pady=6)
 
         # Run button
         btn_row = tk.Frame(content, bg=BG)
@@ -970,6 +984,9 @@ class UyaramApp(tk.Tk):
         self._log_line("Phase 2 — Processing tiles…", "bright")
         ok = fail = 0
 
+        # Track outputs for per-class mosaic (split mode only)
+        class_outputs: dict[str, list[Path]] = {} if split_mode else None
+
         for laz in valid:
             self._log_line(f"\n  ▶ {laz.name}", "accent")
             try:
@@ -1038,9 +1055,8 @@ class UyaramApp(tk.Tk):
                     })
 
                     # GDAL writer
-                    # Split mode uses nodata=0 so empty cells sit at ground
-                    # level and planes stack cleanly in Blender without
-                    # negative displacement artefacts from unused regions.
+                    # Split mode uses nodata=-1 so empty cells are distinct from ground
+                    # Combined mode uses nodata=-2 to avoid blending with real terrain
                     nodata_val = -1 if (split_mode and code is not None) else -2
 
                     steps.append({
@@ -1063,24 +1079,41 @@ class UyaramApp(tk.Tk):
                         stderr=subprocess.STDOUT,
                         text=True, bufsize=1, errors="replace"
                     )
+                    pdal_output = []
                     for line in process.stdout:
                         line = line.strip()
                         if line:
-                            self._log_line(f"    pdal: {line}", "dim")
+                            pdal_output.append(line)
+                            # Suppress "no points" warnings for empty classes
+                            if "Unable to write GDAL data with no points" not in line:
+                                self._log_line(f"    pdal: {line}", "dim")
                     process.wait()
                     jf.unlink(missing_ok=True)
 
                     if process.returncode != 0:
-                        self._log_line(
-                            f"    ✗ PDAL error (code {process.returncode})",
-                            "error"
-                        )
-                        fail += 1
-                        continue
+                        # Check if it's a "no points" error (graceful skip)
+                        if any("Unable to write GDAL data with no points" in msg for msg in pdal_output):
+                            self._log_line(
+                                f"    ⚠  No points for class [{code}] {class_label} — skipping",
+                                "warn"
+                            )
+                            continue  # Skip this class, don't count as failure
+                        else:
+                            self._log_line(
+                                f"    ✗ PDAL error (code {process.returncode})",
+                                "error"
+                            )
+                            fail += 1
+                            continue
 
                     self._log_line(
                         f"    ✔ {out_tif.name}", "success"
                     )
+
+                    # Track for mosaic
+                    if split_mode and class_outputs is not None:
+                        key = class_label if code is not None else "combined"
+                        class_outputs.setdefault(key, []).append(out_tif)
 
                 # Blender values — based on full tile header
                 with laspy.open(laz) as fh:
@@ -1088,27 +1121,11 @@ class UyaramApp(tk.Tk):
                     raw_max = fh.header.maxs[2] - gz
 
                 rng = raw_max - raw_min
-                mid = (
-                    abs(raw_min) / rng
-                    if (raw_min < 0 and rng > 0)
-                    else 0.0
-                )
-                mid_note = (
-                    f"{mid:.4f}  ({abs(raw_min):.1f}m below-ground terrain)"
-                    if mid > 0 else "0.0"
-                )
-
-                if raw_min < 0:
-                    self._log_line(
-                        f"    · Depressions : {abs(raw_min):.2f}m preserved",
-                        "accent"
-                    )
 
                 self._log_line(
                     "    ┌─ Blender Displace modifier ───────────────",
                     "warn"
                 )
-                self._log_line(f"    │  Midlevel : {mid_note}", "warn")
                 self._log_line(
                     f"    │  Strength : "
                     f"{rng:.1f} (1×)  {rng*2:.1f} (2×)  {rng*3:.1f} (3×)",
@@ -1124,22 +1141,44 @@ class UyaramApp(tk.Tk):
                 self._log_line(f"    ✗ Error: {e}", "error")
                 fail += 1
 
-        # ── Mosaic (combined mode only) ───────────────────────────────────
-        if self._mosaic_var.get() and ok > 0 and not split_mode:
+        # ── Mosaic (combined mode OR per-class in split mode) ─────────────
+        if self._mosaic_var.get() and ok > 0 and self._gdal_tool and self._gdal_tool.endswith("gdal_merge.py"):
             self._log_line(
                 "\n── Mosaic ──────────────────────────────────────", "dim"
             )
-            tifs   = list(output_path.glob("*_heightmap.tif"))
-            merged = output_path / "merged_heightmap.tif"
-
-            if (
-                tifs and self._gdal_tool and
-                self._gdal_tool.endswith("gdal_merge.py")
-            ):
+            if split_mode:
+                # Merge each class group separately
+                for class_name, tifs in class_outputs.items():
+                    if not tifs:
+                        continue
+                    safe_name = _sanitize_filename(class_name)
+                    merged = output_path / f"merged_{safe_name}.tif"
+                    nodata_arg = "-1"  # match split mode nodata
+                    cmd = (
+                        [sys.executable, self._gdal_tool,
+                         "-o", str(merged), "-of", "GTiff",
+                         "-n", nodata_arg, "-a_nodata", nodata_arg,
+                         "-ot", "Float32",
+                         "-co", "COMPRESS=DEFLATE",
+                         "-co", "PREDICTOR=3"] +
+                        [str(t) for t in tifs]
+                    )
+                    try:
+                        subprocess.run(
+                            cmd, check=True, capture_output=True, text=True
+                        )
+                        self._log_line(f"  ✔ {merged.name} ({class_name})", "success")
+                    except Exception as e:
+                        self._log_line(f"  ✗ Mosaic failed for {class_name}: {e}", "error")
+            else:
+                # Original combined mosaic
+                tifs   = list(output_path.glob("*_heightmap.tif"))
+                merged = output_path / "merged_heightmap.tif"
+                nodata_arg = "-2"  # match combined mode nodata
                 cmd = (
                     [sys.executable, self._gdal_tool,
                      "-o", str(merged), "-of", "GTiff",
-                     "-n", "-2", "-a_nodata", "-2",
+                     "-n", nodata_arg, "-a_nodata", nodata_arg,
                      "-ot", "Float32",
                      "-co", "COMPRESS=DEFLATE",
                      "-co", "PREDICTOR=3"] +
@@ -1152,14 +1191,15 @@ class UyaramApp(tk.Tk):
                     self._log_line(f"  ✔ {merged.name}", "success")
                 except Exception as e:
                     self._log_line(f"  ✗ Mosaic failed: {e}", "error")
-            else:
-                self._log_line(
-                    "  ⚠  gdal_merge.py not found — mosaic skipped", "warn"
-                )
-                self._log_line(
-                    "     Merge manually: QGIS → Raster → Miscellaneous → Merge",
-                    "dim"
-                )
+        elif self._mosaic_var.get() and (not self._gdal_tool or not self._gdal_tool.endswith("gdal_merge.py")):
+            self._log_line(
+                "\n⚠  Mosaic requested but gdal_merge.py not found — skipping",
+                "warn"
+            )
+            self._log_line(
+                "   Ensure QGIS is installed and detected, or merge manually in QGIS.",
+                "dim"
+            )
 
         # ── Summary ───────────────────────────────────────────────────────
         self._log_line(
@@ -1170,52 +1210,6 @@ class UyaramApp(tk.Tk):
             "success" if fail == 0 else "warn"
         )
         self._log_line(f"  Output : {output_path}", "dim")
-
-        self._log_line(
-            "\n── Blender import ──────────────────────────────", "accent"
-        )
-        self._log_line(
-            "  1. Add Plane → Scale to real-world size (S → metres)", "dim"
-        )
-        self._log_line(
-            "  2. Edit Mode → Select All → Right Click → Subdivide → Cuts: 1999",
-            "dim"
-        )
-        self._log_line(
-            "  3. Object Mode → Add Modifier → Displace → New Texture", "dim"
-        )
-        self._log_line(
-            "  4. Open heightmap.tif → Color Space: Non-Color", "dim"
-        )
-        self._log_line(
-            "  5. Midlevel and Strength: use values printed per tile above",
-            "dim"
-        )
-        self._log_line("  6. Shade Flat (not Shade Smooth)", "dim")
-
-        if split_mode:
-            self._log_line(
-                "\n── Split mode stacking in Blender ──────────────",
-                "accent"
-            )
-            self._log_line(
-                "  · Each class is a separate plane at Z=0", "dim"
-            )
-            self._log_line(
-                "  · Empty cells = 0.0 → flat ground, no downward spikes", "dim"
-            )
-            self._log_line(
-                "  · Stack all planes at the same XY position", "dim"
-            )
-            self._log_line(
-                "  · Assign different materials per plane", "dim"
-            )
-            self._log_line(
-                "  · e.g. buildings=white clay · trees=green · ground=beige\n",
-                "dim"
-            )
-        else:
-            self._log_line("", "dim")
 
         self._done(ok, fail)
 
