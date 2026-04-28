@@ -133,53 +133,15 @@ Install the [BlenderGIS addon](https://github.com/domlysz/BlenderGIS), then:
 GIS → Import → Georeferenced Raster
 ```
 
-Select your `_heightmap.tif`. In the import options set **Mode** to `As Displacement Texture`.
+Select your `_heightmap.tif`. In the import options set **Mode** to `DEM as Displacement Texture`.
+Set Subdivision to `Subsurf`
 
-### 2. Modifier Stack (Crash-Proof Setup)
+### 2. Modifier setting
 
-Select the imported plane and confirm the modifier stack (Modifier Properties panel):
+On each tile Set the Render amount to 11 or higher so that the final render will have full detail.
+Can also set Levels Viewport to higher one too if the system can handle it without issues.
 
-```
-[ Subdivision Surface ]   ← must be above Displace
-[ Displace             ]
-```
-
-Set **Subdivision Surface**:
-- Viewport levels: `1`
-- Render levels: `2` *(do not exceed 2 for 1km tiles to avoid crashes)*
-- Type: `Simple`
-
-### 3. Exact Vertex Mapping (Alternative to Subdivision)
-
-For maximum control and zero interpolation artifacts:
-
-1. Add a plane and scale to real-world size (e.g., `S → 1000` for 1km tile)
-2. Edit Mode → Select All → Right Click → **Subdivide**
-3. Set **Number of Cuts**: `1999` (for 2000×2000 vertices at 0.5m resolution)
-4. Object Mode → Add **Displace** modifier only (no Subdivision modifier)
-
-### 4. Displace Modifier Values
-
-Use the values printed by Uyaram in the log:
-
-| Field | Value | Source |
-|---|---|---|
-| **Midlevel** | e.g. `0.0` or `0.0842` | Printed per tile by Uyaram |
-| **Strength** | e.g. `68.4` for 1× scale | Printed per tile - multiply for exaggeration |
-
-**Critical settings**:
-- **Color Space**: `Non-Color` (prevents gamma distortion on float data)
-- **Direction**: `Z`
-- **Midlevel**: Use the exact value printed. If your tile has depressions (negative values), Midlevel will be >0.0.
-- **Strength**: Start with the printed value. Multiply by `1.5–3.0` for cartographic exaggeration.
-
-**Z exaggeration guide:**
-- `1×` - geographically accurate, buildings may look flat
-- `2×` - good general balance
-- `3×` - recommended for clay render aesthetic
-- `5×` - dramatic, matches most published clay relief examples
-
-### 5. Clay Material
+### 3. Clay Material
 
 In Material Properties → New material (Principled BSDF):
 
@@ -191,7 +153,7 @@ In Material Properties → New material (Principled BSDF):
 | Metallic | 0.0 |
 | **Shade Flat** | ✅ (do not use Shade Smooth) |
 
-### 6. Lighting
+### 4. Lighting
 
 Add a Sun lamp (`Shift+A → Light → Sun`):
 
@@ -202,17 +164,15 @@ Add a Sun lamp (`Shift+A → Light → Sun`):
 | Strength | 4.0 |
 | Angle | 1.5° *(sharper shadows reveal fine LiDAR detail)* |
 
-Enable **Ambient Occlusion** in Render Properties:
+(Optional) Enable **Ambient Occlusion** in Render Properties: 
 - Distance: `1.5m` *(adjust to match your tile scale)*
 - Factor: `0.5`
 
-### 7. Camera
+### 5. Camera
+- Select one of the Tiles and Go to GIS -> Camera -> Georender
+- Change dimenstions and Position to match your area
 
-- Type: **Orthographic**
-- For top-down: Rotation `X: 90°`
-- For slight oblique: Rotation `X: 75°, Z: 0°`
-
-### 8. Render
+### 6. Render
 
 - Engine: **Cycles** (not EEVEE)
 - Device: GPU Compute
@@ -228,7 +188,7 @@ If your heightmap shows water reflections or noise artifacts:
 
 ### Option 1: Classification Filter (If Data is Classified)
 - Enable the Classification Filter in Uyaram
-- Uncheck `#9 Water`, `#7 Low Noise`, `#18 High Noise`
+- Uncheck `#1 Unclassified`,`#9 Water`, `#7 Low Noise`, `#18 High Noise`
 - Process as normal
 
 ### Option 2: Intensity Filtering (If Unclassified)
