@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Uyaram v1.2.7 - Point Cloud → Heightmap. Malayalam: Uyaram = height."""
-__version__ = "1.2.7"
+"""Uyaram v2.0.2 - Point Cloud → Heightmap. Malayalam: Uyaram = height."""
+__version__ = "2.0.2"
 
-import sys, os, json, subprocess, shutil, glob, tkinter as tk
+import sys, os, json, subprocess, shutil, glob, tkinter as tk, time, math
 from tkinter import messagebox, filedialog, scrolledtext
 from pathlib import Path
 
@@ -28,9 +28,9 @@ CLASSIFICATIONS = [
     (1, "Unclassified", False, "terrain"), (2, "Ground", True, "terrain"), (6, "Buildings", True, "terrain"),
     (17, "Bridge Deck", True, "terrain"), (3, "Low Vegetation", True, "vegetation"), (4, "Medium Vegetation", True, "vegetation"),
     (5, "High Vegetation", True, "vegetation"), (7, "Low Noise", False, "noise"), (18, "High Noise", False, "noise"),
-    (16, "Overlap", False, "noise"), (9, "Water", False, "water"), (8, "Model Key / Reserved", False, "other"),
+    (16, "Overlap", False, "noise"), (9, "Water", False, "water"), (8, "Model Key / Reserved", True, "other"),
     (10, "Rail", True, "other"), (11, "Road Surface", True, "other"), (13, "Wire Guard", False, "other"),
-    (14, "Wire Conductor", False, "other"), (15, "Transmission Tower", False, "other"), (19, "Overhead Structure", False, "other"),
+    (14, "Wire Conductor", False, "other"), (15, "Transmission Tower", False, "other"), (19, "Overhead Structure", True, "other"),
     (20, "Ignored Ground", False, "other"),
 ]
 CATEGORY_ORDER = ["terrain", "vegetation", "noise", "water", "other"]
@@ -91,6 +91,42 @@ def _build_pdal_range_filter(codes):
     return ",".join(f"Classification[{x}:{y}]" for x, y in ranges)
 
 def _sanitize_filename(l): return l.lower().replace(" ", "-").replace("/", "-")
+def _format_elapsed(secs):
+    if secs < 60: return f"{secs:.1f}s"
+    elif secs < 3600: return f"{int(secs//60)}m {int(secs%60)}s"
+    else: return f"{int(secs//3600)}h {int((secs%3600)//60)}m"
+
+def _merge_and_tile(files, out_path, gdal_tool, nodata_val):
+    """Merges files. Automatically splits into <3GB tiles if needed for Blender."""
+    if not files: return []
+    est_gb = sum(os.path.getsize(f) for f in files) / (1024**3)
+    mp = _get_python_for_gdal_merge(gdal_tool)
+    co = ["-co", "COMPRESS=DEFLATE", "-co", "PREDICTOR=3"]
+    
+    if est_gb <= 3.0:
+        cmd = [mp, gdal_tool, "-o", str(out_path), "-of", "GTiff", "-n", str(nodata_val), 
+               "-a_nodata", str(nodata_val), "-ot", "Float32"] + co + [str(f) for f in files]
+        try: subprocess.run(cmd, check=True, capture_output=True, text=True); return [out_path]
+        except subprocess.CalledProcessError as e: print(f"✗ Mosaic failed: {e.stderr.strip()}"); return []
+
+    # Auto-tile for Blender compatibility
+    n_tiles = math.ceil(est_gb / 2.5)
+    cols, rows = math.ceil(math.sqrt(n_tiles)), math.ceil(n_tiles / math.sqrt(n_tiles))
+    k, m = divmod(len(files), cols * rows)
+    chunks = [files[i*k+min(i, m):(i+1)*k+min(i+1, m)] for i in range(cols * rows)]
+    results = []
+    for i, chunk in enumerate(chunks):
+        if not chunk: continue
+        r, c = i // cols + 1, i % cols + 1
+        tile = out_path.parent / f"{out_path.stem}_r{r}c{c}.tif"
+        cmd = [mp, gdal_tool, "-o", str(tile), "-of", "GTiff", "-n", str(nodata_val),
+               "-a_nodata", str(nodata_val), "-ot", "Float32"] + co + [str(f) for f in chunk]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            results.append(tile)
+        except subprocess.CalledProcessError as e:
+            print(f"✗ Tile r{r}c{c} failed: {e.stderr.strip()}")
+    return results
 
 class StartupChecker(tk.Toplevel):
     def __init__(s, parent, on_ready):
@@ -229,6 +265,7 @@ class UyaramApp(tk.Tk):
         s._processing = True; s._run_btn.config(state="disabled", bg=BORDER, fg=TEXT_DIM); s._status_lbl.config(text="Processing…", fg=ACCENT)
         import threading; threading.Thread(target=s._pipeline_thread, args=(sp, op, res, sel, summ, split), daemon=True).start()
     def _pipeline_thread(s, sp, op, res, sel, summ, split):
+        start_time = time.time()
         try: import laspy
         except ImportError: s._log_line("✗  laspy not available. Restart to reinstall.", "error"); s._done(); return
         s._log_line("── Batch start ─────────────────────────────────", "dim"); s._log_line(f"  Source     : {sp}", "dim"); s._log_line(f"  Output     : {op}", "dim"); s._log_line(f"  Resolution : {res}m/px", "dim"); s._log_line(f"  Filter     : {summ}", "dim")
@@ -244,9 +281,10 @@ class UyaramApp(tk.Tk):
             except Exception as e: s._log_line(f"  ⚠  Header failed - {f.name}: {e}", "warn")
         if not valid: s._log_line("✗  No valid files. Aborting.", "error"); s._done(); return
         gx, gy, gz = tx/len(valid), ty/len(valid), mz; s._log_line(f"  X offset   : {gx:.4f}", "dim"); s._log_line(f"  Y offset   : {gy:.4f}", "dim"); s._log_line(f"  Z ground   : {gz:.4f}m → 0.0\n", "dim")
-        s._log_line("Phase 2 — Processing tiles…", "bright"); ok = fail = 0; co = {} if split else None
-        for laz in valid:
-            s._log_line(f"\n  ▶ {laz.name}", "accent")
+        s._log_line("Phase 2 — Processing tiles…", "bright"); s._log_line(f"  Processing 1/{len(valid)} files…", "dim")
+        ok = fail = 0; co = {} if split else None
+        for i, laz in enumerate(valid, 1):
+            s._log_line(f"\n  ▶ [{i}/{len(valid)}] {laz.name}", "accent")
             try:
                 passes = [(c, next(l for x, l, _, _ in CLASSIFICATIONS if x==c)) for c in sel] if (split and sel) else [(None, "combined")]; skips = []
                 for code, lbl in passes:
@@ -278,17 +316,17 @@ class UyaramApp(tk.Tk):
             if split:
                 for cn, ts in co.items():
                     if not ts: continue
-                    mg = op / f"merged_{_sanitize_filename(cn)}.tif"; na = "-1"
-                    cmd = [sys.executable, s._gdal_tool, "-o", str(mg), "-of", "GTiff", "-n", na, "-a_nodata", na, "-ot", "Float32", "-co", "COMPRESS=DEFLATE", "-co", "PREDICTOR=3"] + [str(t) for t in ts]
-                    try: subprocess.run(cmd, check=True, capture_output=True, text=True); s._log_line(f"  ✔ {mg.name} ({cn})", "success")
-                    except subprocess.CalledProcessError as e: s._log_line(f"  ✗ Mosaic failed for {cn}: {e.stderr.strip() or e.stdout.strip()}", "error")
+                    mg = op / f"merged_{_sanitize_filename(cn)}.tif"
+                    merged = _merge_and_tile(ts, mg, s._gdal_tool, -1)
+                    for m in merged: s._log_line(f"  ✔ {m.name} ({cn})", "success")
             else:
-                ts = list(op.glob("*_heightmap.tif")); mg = op / "merged_heightmap.tif"; na = "-2"; mp = _get_python_for_gdal_merge(s._gdal_tool)
-                cmd = [mp, s._gdal_tool, "-o", str(mg), "-of", "GTiff", "-n", na, "-a_nodata", na, "-ot", "Float32", "-co", "COMPRESS=DEFLATE", "-co", "PREDICTOR=3"] + [str(t) for t in ts]
-                try: subprocess.run(cmd, check=True, capture_output=True, text=True); s._log_line(f"  ✔ {mg.name}", "success")
-                except subprocess.CalledProcessError as e: s._log_line(f"  ✗ Mosaic failed: {e.stderr.strip() or e.stdout.strip()}", "error")
+                ts = list(op.glob("*_heightmap.tif")); mg = op / "merged_heightmap.tif"
+                merged = _merge_and_tile(ts, mg, s._gdal_tool, -2)
+                for m in merged: s._log_line(f"  ✔ {m.name}", "success")
         elif s._mosaic_var.get(): s._log_line("\n⚠  Mosaic requested but gdal_merge.py not found — skipping", "warn"); s._log_line("   Ensure QGIS is installed and detected, or merge manually in QGIS.", "dim")
-        s._log_line("\n── Batch complete ──────────────────────────────", "dim"); s._log_line(f"  ✔ {ok} succeeded   ✗ {fail} failed", "success" if fail == 0 else "warn"); s._log_line(f"  Output : {op}", "dim"); s._done(ok, fail)
+        elapsed = time.time() - start_time
+        s._log_line(f"\n── Batch complete in {_format_elapsed(elapsed)} ──────────────────────────────", "dim")
+        s._log_line(f"  ✔ {ok} succeeded   ✗ {fail} failed", "success" if fail == 0 else "warn"); s._log_line(f"  Output : {op}", "dim"); s._done(ok, fail)
     def _done(s, success=0, fail=0):
         def _u(): s._processing = False; s._run_btn.config(state="normal", bg=ACCENT, fg=BG); s._status_lbl.config(text=f"Done — {success} ok, {fail} failed", fg=SUCCESS if fail == 0 else WARN)
         s.after(0, _u)
