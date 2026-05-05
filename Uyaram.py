@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Uyaram v2.0.2 - Point Cloud → Heightmap. Malayalam: Uyaram = height."""
-__version__ = "2.0.2"
+"""Uyaram v2.0.3 - Point Cloud → Heightmap. Malayalam: Uyaram = height."""
+__version__ = "2.0.3"
 
 import sys, os, json, subprocess, shutil, glob, tkinter as tk, time, math
 from tkinter import messagebox, filedialog, scrolledtext
@@ -241,14 +241,29 @@ class UyaramApp(tk.Tk):
         tk.Label(frame, text=label, font=FONT_HEAD, fg=TEXT_BRT, bg=BG, width=14, anchor="w").pack(side="left")
         entry = tk.Entry(frame, textvariable=var, font=FONT_MONO, bg=SURFACE2, fg=TEXT_DIM, insertbackground=ACCENT, relief="flat", highlightthickness=1, highlightbackground=BORDER)
         entry.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 8)); entry.insert(0, hint)
-        def on_in(e, en=entry, h=hint): en.delete(0, "end") if en.get() == h else None; en.config(fg=TEXT)
-        def on_out(e, en=entry, h=hint, v=var): val = en.get().strip(); en.delete(0, "end"); en.insert(0, h); en.config(fg=TEXT_DIM); v.set("") if not val or val == h else None
+        
+        def on_in(e, en=entry, h=hint): 
+            if en.get() == h: en.delete(0, "end")
+            en.config(fg=TEXT)
+
+        def on_out(e, en=entry, h=hint, v=var):
+            val = en.get().strip()
+            if not val or val == h:
+                en.delete(0, "end")
+                en.insert(0, h)
+                en.config(fg=TEXT_DIM)
+                v.set("")
+
         entry.bind("<FocusIn>", on_in); entry.bind("<FocusOut>", on_out)
         tk.Button(frame, text="Browse…", font=FONT_SMALL, fg=ACCENT, bg=SURFACE2, activeforeground=TEXT_BRT, activebackground=SURFACE, relief="flat", cursor="hand2", padx=10, pady=5, command=command).pack(side="left"); return entry
     def _browse_source(s): f = filedialog.askdirectory(title="Select folder containing .las/.laz files"); s._update_path(s._source_entry, f)
     def _browse_output(s): f = filedialog.askdirectory(title="Select output folder"); s._update_path(s._output_entry, f)
     def _update_path(s, entry, path): 
-        if path: (s._source_var if entry is s._source_entry else s._output_var).set(path); entry.config(fg=TEXT); entry.delete(0, "end"); entry.insert(0, path)
+        if path: 
+            (s._source_var if entry is s._source_entry else s._output_var).set(path)
+            entry.config(fg=TEXT)
+            entry.delete(0, "end")
+            entry.insert(0, path)
     def _start_processing(s):
         if s._processing: return
         src = s._source_entry.get().strip()
